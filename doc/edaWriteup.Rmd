@@ -1,0 +1,1367 @@
+---
+title: "Fixed vs Random"
+author: "TXN"
+date: "2023-06-01"
+output: 
+  html_document:
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(dpi=320, fig.width=15, fig.height=10, warning=FALSE, message=F, 
+                      dev = "CairoPNG",
+                      dev.args = list(pointsize = 13), echo = T)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readxl)
+library(ggdark)
+library(PTAk)
+library(cluster)
+library(dendextend)
+library(lubridate)
+
+options(scipen = 99999)
+
+myTheme <- dark_theme_bw(base_size = 24) +
+  theme(panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "#2c2828", color = NA),
+        panel.background = element_blank(),
+        # panel.grid.major = element_blank(),
+        panel.grid.major = element_line(color = "#646464", size = 0.2),
+        legend.background = element_blank(),
+        legend.key = element_blank())
+
+theme_set(myTheme)
+```
+
+## Purpose
+
+This document outlines initial exploratory analysis of the FMWT fixed (hereafter "FMWT") vs random station (hereafter "SS") datasets. The main goal is to understand if data from the two trawling methods yield similar community compositions or not.
+
+## Reading in the data and relevant manipulations
+
+Data was provided by James White as an RDS file. Final QAQC has been finalized. Unidentified species and jellyfish were removed from the analysis as they are not species specific.
+
+```{r data manipulations}
+data <- readRDS(file.path("..", "data", "SSdata.Rds")) %>%
+  data.frame() %>% 
+  mutate(same = ifelse(all.equal(Catch / Volume * 1000, CPUE), T, F),
+         # Creating a month column to define the time component as month-year
+         month = case_when(SurveyNumber == 3 ~ 9,
+                           SurveyNumber == 4 ~ 10,
+                           SurveyNumber == 5 ~ 11,
+                           SurveyNumber == 6 ~ 12)
+         # # Combine all striped bass into a singular
+         # Species = ifelse(Species %in% c("Striped Bass age-0", "Striped Bass age-1",
+         #                                 "Striped Bass age-2", "Striped Bass age-3"),
+         #                  "Striped Bass", Species)
+  ) %>%
+  # Removing "Goby (unid)" from the analysis
+  dplyr::filter(!Species %in% c("Goby (unid)", "Jellyfish", "Unid")) %>%
+  rename(Station = StationCode) %>%
+  # Split the data into a list of two elements
+  split(., .$Study)
+
+# Are there important stations that should not be removed?
+importantStations <- NA
+```
+
+## Spotty data
+
+The sampling period when both the FMWT and SS were on the water are limited. In 2021, the SS was sampled approximately two weeks after the FMWT and an atmopsheric river occurred in between. Due to this, the 2021 data is excluded from analysis. In 2022, boat mechanical issues precluded sampling of all regions across all four survey months. Specifically, only the Sacramento Ship Channel, Cache Slough, and Confluence regions were sampled across all four months; the Suisun Marsh and Suisun and Honker Bays regions were sampled for only three months; and when including Napa River and San Pablo Bay and Carqueniz Strait, sampling coverage is reduced to only two months (Figure 1)
+
+```{r spotty data, fig.cap="Figure 1. Sampling period of the FMWT fixed and random stations from October 2021 to December 2022. A grid is shaded if sampling occurred in that region for the sampling month."}
+data$FMWTRegion <- data$FMWT %>% 
+  mutate(Station = Region) %>% 
+  group_by(Study, Year, SurveyNumber, month, Station, Region, Species) %>% 
+  summarise(CPUE = mean(CPUE, na.rm = T), .groups = "drop")
+
+data$SSRegion <- data$SS %>%
+  mutate(Station = Region) %>%
+  group_by(Study, Year, SurveyNumber, month, Station, Region, Species) %>%
+  summarise(CPUE = mean(CPUE, na.rm = T), .groups = "drop")
+
+data$SS %>%
+    distinct(Region, month, Year) %>%
+    mutate(dateDummy = as.Date(paste(Year, month, "01", sep = "-"))) %>%
+    arrange(dateDummy) %>%
+    mutate(dateDummy = reorder(as.character(format(dateDummy, "%b-%Y")), dateDummy),
+           regionFactor = as.numeric(factor(Region, levels = unique(Region)))) %>%
+  {
+    ggplot(., aes(dateDummy, regionFactor)) +
+      geom_tile(color = "black") +
+      theme(panel.grid.major = element_blank()) +
+      scale_y_continuous(sec.axis = sec_axis(~.*1,
+                                             breaks = seq(2, max(.$regionFactor), 2),
+                                             labels = filter(., regionFactor %in%
+                                                               seq(2, max(.$regionFactor), 2)) %>%
+                                               pull(Region) %>%
+                                               unique() %>%
+                                               as.character()),
+                         breaks = seq(1, max(.$regionFactor), 2),
+                         labels = filter(., regionFactor %in% seq(1, max(.$regionFactor), 2)) %>%
+                            pull(Region) %>%
+                           unique() %>%
+                           as.character())
+  } +
+  labs(x = "Month-Year", y = "Region") +
+  theme(axis.text.y = element_text(size = 15))
+```
+
+In this initial analysis, data is constrained to the Cache Slough, Sacramento Ship Channel, and Confluence Regions and for year 2022 only to leverage all four sampling months.
+
+## Helper functions
+
+Helper functions are used throughout this analysis. The generalized overall workflow between data and model results are:
+
+1. data manipulations
+2. train the PTA model
+3. execute the clustering
+4. evaluate the community composition via a dendogram.
+
+This general workflow is aided by specific helper functions:
+
+1. Filter the dataset to account for: `filterDataset()`; `selectSpecies()`
+    a. only stations that have been sampled consistently during the temporal period of interest
+    b. only species of interest
+    c. only years of interest
+2. Transform the catch data to log scale: `transformation()`
+3. Convert filtered and transformed data into an input appropriate for the PTA3 model, i.e., a 3d array: `buildArray()`
+4. Run the model: `simulateRemoval()`
+    a. Note: steps 1-3 are helper functions within this larger function
+5. Select the top tensors to keep: `keepTensors()`
+6. Calculate the distance matrix from the decomposition: `createProjectionDF()`
+7. Calculate the optimal clustering method and optiomal number of clusters: `optimizeCluster()`
+8. Evaluate the community by visualizing the dendogram: `evaluateCommunity()`
+
+```{r helper functions}
+# Filter for sampling stations that have had a complete period of record (no missing data)
+# Data can be aggregated accordingly to fulfill this requirement of a PTA model
+stationFilterYear <- function(data, yearStart, perSurvey = F) {
+
+  if (perSurvey) {
+    elapsedTime <- (max(data$Year) - yearStart + 1) * 4 # 4 surveys
+
+    dataDistinct <- data %>%
+      distinct(Year, month, Station)
+  } else {
+    elapsedTime <- (max(data$Year) - yearStart + 1)
+
+    dataDistinct <- data %>%
+      distinct(Year, Station)
+  }
+
+  dataDistinct %>%
+    filter(Year >= yearStart) %>%
+    group_by(Station) %>%
+    count() %>%
+    filter(n == elapsedTime) %>%
+    pull(Station)
+}
+
+# Transformation function, to apply a transformation and centering/scaling if asked
+transformation <- function(x, transformation = c("log", "squareRoot", "cubicRoot", "fourthRoot"), zscore = F) {
+  transformation <- match.arg(transformation)
+  y <- switch(transformation,
+              log = log(x + 1),
+              squareRoot = sqrt(x),
+              cubicRoot = x^(1/3),
+              fourthRoot = x^(1/4))
+
+  if (isTRUE(zscore)) {
+    y = (y - mean(y))/sd(y)
+  }
+  y
+}
+
+# Calculating overlap between two distributions; currently only adds up the density curve
+# Can integrate below the function, but that can cause NAs in certain overlaps
+overlapping_coefficient <- function(x, y,
+                                    transformation = c("raw", "log", "squareRoot", "cubicRoot", "fourthRoot"),
+                                    centered = T, figure = F){
+
+  # First, calculate skewness
+  skew <- lapply(list(x, y), function(var) round(e1071::skewness(var), 4))
+
+  transformation <- match.arg(transformation)
+
+  xTransformed <- switch(transformation,
+                         raw = x,
+                         log = log(x + 1),
+                         squareRoot = sqrt(x),
+                         cubicRoot = x^(1/3),
+                         fourthRoot = x^(1/4))
+
+  yTransformed <- switch(transformation,
+                         raw = y,
+                         log = log(y + 1),
+                         squareRoot = sqrt(y),
+                         cubicRoot = y^(1/3),
+                         fourthRoot = y^(1/4))
+
+  if (isTRUE(centered)) {
+    xTransformed <- (xTransformed - mean(xTransformed))/sd(xTransformed)
+    yTransformed <- (yTransformed - mean(yTransformed))/sd(yTransformed)
+  }
+
+  if (transformation != "raw") {
+    skewTransformed <- lapply(list(xTransformed, yTransformed), function(var) round(e1071::skewness(var), 4))
+  } else {
+    skewTransformed <- "raw"
+  }
+
+  combined <- c(xTransformed, yTransformed)
+
+  densityX <- density(xTransformed, from = min(combined), to = max(combined), n = 2^10)
+  densityY <- density(yTransformed, from = min(combined), to = max(combined), n = 2^10)
+
+  joint <- pmin(densityX$y, densityY$y)
+  overlap <- mean(sum(joint)/sum(densityX$y),
+                  sum(joint)/sum(densityY$Y))
+
+  p <- data.frame(x = rep(densityX$x, 3),
+                  y = c(densityX$y, densityY$y, joint),
+                  data = factor(rep(c("x", "y", "overlap"), each = length(densityX$x)),
+                                levels = c("x", "y", "overlap"))) %>%
+    ggplot(aes(x, y, fill = data)) +
+    geom_area(position = position_identity(), color = "black") +
+    scale_fill_brewer(palette = "Dark2") +
+    labs(subtitle = paste0("Overlap: ", round(overlap, 4), "\nSkewness Old (x, y): ",
+                           paste(skew, collapse = ", "), "\nSkewness New (x, y): ",
+                           ifelse(is.character(skewTransformed), "No change",
+                                  paste(skewTransformed, collapse = ", "))))
+  if (isTRUE(figure)) {
+    return(p)
+  }
+
+  data.frame(transformation = transformation,
+             skewOld = unlist(skew),
+             skewNew = ifelse(is.character(skewTransformed), NA, unlist(skewTransformed)),
+             overlap = overlap)
+}
+
+# The following functions serve to prepare the dataframe before running the PTA models
+# This `filterDataset` has been reused and contains generic arguments meant for other applications
+filterDataset <- function(data,
+                          stationYear,
+                          speciesThreshold, propThres,
+                          # These two tables should be created beforehand
+                          stationAdd = NULL, stationRemove = NULL,
+                          speciesAdd = NULL, speciesRemove = NULL,
+                          # If you wanted a static list of stations or species
+                          stationFixed = NULL,
+                          speciesFixed = NULL,
+                          stationDF = stationConsistentYear) {
+  # stationYear will depend on the stationConsistentYear data frame; detects which year to use
+  # The list of stations will come from the data frame
+  # speciesThreshold will depend on the fishOccurencesYearly table, in which total number
+  # of catch per year will be used as the filter. Species with values >= provided number
+  # will be returned
+
+  if (is.null(stationFixed)) {
+    stationsToKeep <- stationDF %>%
+      filter(Year == stationYear) %>%
+      pull(Station) %>%
+      c(stationAdd, .) %>%
+      unique()
+
+    if (!is.null(stationRemove)) {
+      stationsToKeep <- stationsToKeep[-which(stationsToKeep %in% stationRemove)]
+    }
+  } else {
+    stationsToKeep <- stationFixed
+  }
+
+  if (is.null(speciesFixed)) {
+    speciesToKeep <- speciesPropZero %>%
+      filter(propZero <= quantile(propZero, propThres)) %>%
+      pull(Species) %>%
+      c(speciesAdd, .) %>%
+      unique()
+
+  } else {
+    speciesToKeep <- speciesFixed
+  }
+
+  if (!is.null(speciesRemove)) {
+    speciesToRemove <- which(speciesToKeep %in% speciesRemove)
+
+    if (length(speciesToRemove) > 0) {
+      speciesToKeep <- speciesToKeep[-speciesToRemove]
+    }
+  }
+
+  data %>%
+    filter(Station %in% stationsToKeep,
+           Species %in% speciesToKeep,
+           Year >= stationYear)
+}
+
+# This function simply converts a long formatted dataframe into a wide one, transitions into
+# a list and finally into an array
+buildArray <- function(data) {
+
+  fishListSurvey <- data %>%
+    mutate(Species = as.character(Species)) %>%
+    pivot_wider(names_from = timeStep,
+                values_from = CPUE)
+
+  # Are there stations that are NAs...More a problem as you get to less and less data
+  # also a problem as the station filter (filterDataset) is on a YEARLY time step,
+  # but if there are entire surveys missing, the filter will not pick it up
+  missingData <- fishListSurvey %>%
+    filter(if_any(everything(), is.na)) %>%
+    pivot_longer(-c(Station, Species), names_to = "Year", values_to = "CPUE") %>%
+    filter(is.na(CPUE)) %>%
+    distinct(Station, Year)
+
+  if (nrow(missingData) > 0) {
+    warning("NAs found for station(s) ", paste(unique(missingData$Station), collapse = ", "),
+            " for years(s) ", paste(unique(missingData$Year), collapse = ", "), ". Removing these stations",
+            call. = F)
+  }
+
+  fishListSurvey <- fishListSurvey %>%
+    filter(!Station %in% missingData$Station) %>%
+    {split(.[, !names(.) %in% "Species"], .$Species)} %>%
+    {lapply(., function(x) {
+      tibble::column_to_rownames(.data = x, var = "Station")
+    })}
+
+  fishArraySurvey <- fishListSurvey %>%
+    # Number of station, Number of Survey, Number of species
+    {array(unlist(.), dim = c((data$Station %>% unique() %>% length()) - length(unique(missingData$Station)),
+                              data$timeStep %>% unique() %>% length(),
+                              data$Species %>% unique() %>% length()))}
+
+  dimnames(fishArraySurvey) <- list(rownames(fishListSurvey[[1]]), # Any of the array element works here
+                                    names(fishListSurvey[[1]]),
+                                    names(fishListSurvey))
+
+  fishArraySurvey
+}
+
+# Relies on the speciesCatchRate data frame, which is the number of sampling events during which a species
+# was caught, per species. This simple function pulls the vector of species that are >= the number of times
+# that the species were sampled
+selectSpecies <- function(data, index) {
+  speciesCatchRate %>%
+    group_by(overallCatch) %>%
+    mutate(groupIndex = cur_group_id()) %>%
+    filter(groupIndex >= index) %>%
+    pull(Species)
+}
+
+# This function is taken directly from the plot screen function itself but only through the data extraction steps
+# Recreating the figure in ggplot fpr consistency of style and ease of manipulations by me
+pScree <- function(model) {
+  solution <- model
+  
+  nbvs = 40
+  lengthlabels = 2
+  coefi = list(NULL, 
+               NULL)
+  
+  if (is.null(coefi[[1]])) 
+    coefi[[1]] <- rep(1, length(solution))
+  if (is.null(coefi[[2]])) 
+    coefi[[2]] <- rep(1, length(solution))
+  if (is.null(lengthlabels)) 
+    lengthlabels <- rep(10, length(solution))
+  if (length(lengthlabels) == 1) 
+    lengthlabels <- rep(lengthlabels, length(solution))
+  ord <- length(solution)
+  
+  if (inherits(solution, "PTAk")) {
+    divv <- solution[[ord]]$ssX[1]
+    perclab <- "% global"
+  } else {
+    stop("This function was created only to work with a PTAk model. Use the default plot() function instead.")
+  }
+  
+  di <- NULL
+  for (r in 1:length(solution)) di <- c(di, length(solution[[r]]$v[1, 
+  ]))
+  
+  
+  ld <- length(solution[[ord]]$d[!substr(solution[[ord]]$vsnam, 
+                                         1, 1) == "*"])
+  if (length(nbvs) == 1) {
+    nbvs <- min(max(3, nbvs), ld)
+    nbvs <- 1:nbvs
+  }
+  scre <- 100 * ((solution[[ord]]$d[!substr(solution[[ord]]$vsnam, 
+                                            1, 1) == "*"])^2)/divv
+  scre <- (sort(scre[nbvs]))
+  scre <- scre[length(scre):1]
+
+  nbvs <- nbvs[1:length(scre)]
+  
+  data.frame(tensorNumber = nbvs, 
+             squaredSingularValues = scre) %>% 
+    mutate(summationSsv = cumsum(squaredSingularValues) * max(scales::pretty_breaks()(scre))/100) %>% 
+    ggplot(aes(tensorNumber, squaredSingularValues)) +
+    geom_point(size = 5) + 
+    geom_line(aes(y = summationSsv), size = 1) +
+    geom_label(aes(y = summationSsv, label = "C"), size = 5) +
+    scale_x_continuous(breaks = nbvs) +
+    scale_y_continuous(sec.axis = ~. * 100/max(scales::pretty_breaks()(scre))) +
+    labs(x = "Component Number", y = "Squared Singular Value (%)")
+}
+
+# Function to run the data through the PTA modeling process itself
+# NOTE: transformation needs to be specified manually WITHIN this function
+# Data is scaled and centered using the MultiCent function, which does it per species
+simulateRemoval <- function(data, removeStations = NULL,
+                            timeStep = c("Year", "Survey"),
+                            yearStart,
+                            speciesThres = NULL,
+                            propThres = NULL,
+                            removeSpecies = NULL,
+                            modeNames = c("Station", "Survey", "Species"),
+                            iteration = NULL,
+                            ...) {
+
+  # Determine stations to remove, checking with those that cannot be removed
+  if (any(removeStations %in% importantStations)) {
+    cantRemove <- removeStations[which(removeStations %in% importantStations)]
+    cat("Station(s)", paste(c(cantRemove), collapse = ", "), "will not be removed. \n")
+    removeStations <- c(removeStations[which(!removeStations %in% cantRemove)])
+  } else {
+    if (length(removeStations) == 0) {
+      removeStations = NULL
+    }
+    cantRemove = NULL
+  }
+
+  if (length(removeSpecies) == 0) removeSpecies = NULL
+
+  # Design the simulation array with the appropriate filters
+  preArray <- data %>%
+    filterDataset(stationYear = yearStart,
+                  stationRemove = removeStations,
+                  speciesThreshold = speciesThres,
+                  propThres = propThres,
+                  speciesRemove = removeSpecies, ...) %>%
+    mutate(CPUE = transformation(CPUE, "log", zscore = F))
+
+  # Creating the relevant time step:
+  if (timeStep == "Year") {
+    preArray <- preArray %>%
+      mutate(timeStep = Year) %>%
+      group_by(timeStep, Station, Species) %>%
+      summarise(CPUE = sqrt(ceiling(sum(CPUE))), .groups = "drop")
+  } else {
+    if (timeStep == "Survey") {
+      preArray <- preArray %>%
+        mutate(timeStep = SurveyNumber) %>%
+        select(timeStep, Station, Species, CPUE)
+    } else {
+      stop("Check your timeStep value.", call. = F)
+    }
+  }
+
+  simulation <- preArray %>%
+    buildArray()
+
+  cat("Model parameters: ", paste(c(unique(iteration), yearStart, removeStations,
+                                    speciesThres, removeSpecies),
+                                  collapse = ", "), "\n\n")
+
+  # Scale the simulation array and then run the PTA
+  set.seed(135)
+  # This Multcent function scales and centers the data...
+  # Starts by finding the mean catch of each species across all space/time
+  # Then subtracts that mean from each value
+  # Then, find sd per species across all space/time and scale each entry
+  ptaModel <- Multcent(dat = simulation,
+                       bi = NULL, by = 3, centre = mean,
+                       centrebyBA = c(TRUE, FALSE),
+                       scalebyBA = c(TRUE, FALSE)) %>%
+    PTA3(nbPT = 3, nbPT2 = 3,
+         minpct = 0.1)
+
+  # There are 3 modes here:
+  # 1 = station (spatial mode)
+  # 2 = surveys
+  # 3 = species
+  # JUST NOTE THOUGH, the last "mode" will also contain other data saved by the object
+  names(ptaModel) <- modeNames
+
+  # Summarize the PTA
+  modelScaleSummary <- summary(ptaModel, testvar = 0)
+
+  # The scree plot to determine # of tensors to keep
+  plotScree <- pScree(ptaModel)
+
+  list(cantRemove = cantRemove,
+       removeStations = removeStations,
+       preArray = preArray,
+       ptaModel = ptaModel,
+       modelScaleSummary = modelScaleSummary,
+       plotScree = plotScree)
+}
+
+# Choosing which tensors to keep, informed by the scree plot
+keepTensors <- function(data, start = 1, end) {
+  data %>%
+    data.frame() %>%
+    arrange(-`X..Global.Pct..`) %>%
+    slice(start:end) %>%
+    pull(X.no.)
+}
+
+# Creates the projection DF/distance matrix using the selected tensors for clustering
+# Creating the projection DF
+createProjectionDF <- function(tensorsToKeep, model, mode = "Species") {
+
+  if (is.null(names(model)))
+    stop("Model modes are not named. Either name them or provide index value.", call. = F)
+
+  projectionDF <- t(model[[mode]]$v[c(tensorsToKeep),])
+  rownames(projectionDF) <- model[[mode]]$n
+
+  projectionDF
+}
+
+# To the distance matrix, what clustering method is the best
+# Determine the optimal number of clusters
+optimizeCluster <- function(data, distMethod = "euclidean") {
+  # data = projection DF
+
+  # Calculate evaluation metrics for the various clustering methods:
+  # ward.D2, single, complete, and average
+  # The evaluation metrics are cophenetic correlation and Gower's distance
+  evalTable <- function(data, distMethod = "euclidean") {
+
+    dist1 = dist(data, method = distMethod)
+
+    ##  Ward_2 clustering
+    hclust.ward2<- hclust(dist1, method = "ward.D2")
+    ward2.coph <- cophenetic(hclust.ward2)
+    cophcorr.ward2 <- cor(dist1, ward2.coph)
+
+    ##  Single linkage
+    hclust.single <- hclust(dist1, method="single")
+    single.coph <- cophenetic(hclust.single)
+    cophcorr.single <- cor(dist1, single.coph)
+
+    ##  Complete linkage
+    hclust.complete <- hclust(dist1, method="complete")
+    complete.coph <- cophenetic(hclust.complete)
+    cophcorr.complete <- cor(dist1, complete.coph)
+
+    ##  Average clustering
+    hclust.avg <- hclust(dist1, method="average")
+    avg.coph <- cophenetic(hclust.avg)
+    cophcorr.avg <- cor(dist1, avg.coph)
+
+    #####
+
+    gow.dist.single <- sum((dist1 - single.coph)^2)
+    gow.dist.complete <- sum((dist1 - complete.coph)^2)
+    gow.dist.average <- sum((dist1 - avg.coph)^2)
+    gow.dist.ward2 <- sum((dist1 - ward2.coph)^2)
+
+    ###
+    #####  Combine coph corr and Gower dist in a dataframe   #####
+    ###
+
+    fit.metrics = data.frame(clustmethod = c("single", "complete", "avg", "ward2"),
+                             cophcorr = c(cophcorr.single, cophcorr.complete,
+                                          cophcorr.avg, cophcorr.ward2),
+                             gowdist = c(gow.dist.single, gow.dist.complete,
+                                         gow.dist.average, gow.dist.ward2))
+
+    bestClusterMethod <- filter(fit.metrics, cophcorr == max(cophcorr), gowdist == min(gowdist)) %>%
+      pull(clustmethod)
+
+    if (length(bestClusterMethod) == 0) {
+      warning("Selection based on cophenetic correlation and Gower's distance are different. Defaulting to avg", call. = F)
+      bestClusterMethod <- "manual"
+    }
+
+    print(bestClusterMethod)
+
+    if (bestClusterMethod == "single") hclustBest = hclust.single
+    else if (bestClusterMethod == "complete") hclustBest = hclust.complete
+    else if (bestClusterMethod == "avg") hclustBest = hclust.avg
+    else if (bestClusterMethod == "ward2") hclustBest = hclust.ward2
+    else if (bestClusterMethod == "manual") hclustBest = hclust.avg
+
+    list(fitTable = fit.metrics,
+         bestClusterMethod = bestClusterMethod,
+         hclustBest = hclustBest,
+         dist = dist1)
+  }
+
+  evalMetric <- evalTable(data)
+
+  # Calculate optimal cluster via silhouette length
+  asw = numeric(nrow(data))
+  # write values
+  for(k in 2:(nrow(data)-1)) {
+    sil = silhouette(cutree(evalMetric$hclustBest, k = k), evalMetric$dist)
+    asw[k] = summary(sil)$avg.width
+  }
+
+  # best (largest Silhouette width)
+  k.best.silhouette = which.max(asw)
+
+  # Plotting the best cluster
+  p <- data.frame(numClust = factor(1:nrow(data)),
+                  avgSilDist = asw) %>%
+    mutate(bestSil = ifelse(avgSilDist == max(avgSilDist), T, NA)) %>%
+    {ggplot(., aes(numClust, avgSilDist, fill = bestSil)) +
+        geom_col(width = 0.5, show.legend = F) +
+        geom_label(data = filter(., bestSil), aes(x = 0.9 * nrow(data), 0.9 * max(avgSilDist),
+                                                  label = paste0("Best = ", numClust)),
+                   size = 10, label.padding = unit(1, "lines"),
+                   fill = "#2c2828", inherit.aes = F) +
+        labs(x = "Clusters", y = "Average Silhouette Distance")}
+
+  # Resulting cluster assignments to each species
+  clusterAssignments <- cutree(evalMetric$hclustBest, k.best.silhouette) %>%
+    sort()
+
+  taxaDendro <- as.dendrogram(evalMetric$hclustBest)
+
+  list(fitTable = evalMetric$fitTable,
+       bestClusterMethod = evalMetric$bestClusterMethod,
+       hclustBest = evalMetric$hclustBest,
+       dist = evalMetric$dist,
+       k.best.silhouette = k.best.silhouette,
+       p = p,
+       clusterAssignments = clusterAssignments,
+       taxaDendro = taxaDendro)
+}
+
+# Finally, create the dendogram representation of the clustering. Also calculates various visualizations to
+# check intuition of the model
+cols <- c('#01665e', '#8c510a', '#b2182b', '#5ab4ac', '#d8b365', '#d6604d', '#c7eae5', '#f6e8c3', '#f4a582','white')
+
+evaluateCommunity <- function(dendo, k, dist, preArray, colors,
+                              fullModelDendro, untangleMethod,
+                              iteration = NULL,
+                              plot = F,
+                              ...) {
+
+  if (plot) {
+
+    # # old code
+    # p <- dendo %>%
+    #   set("branches_col", "#878787") %>%
+    #   set("branches_lwd", 1.1) %>%
+    #   color_branches(k = k, col = colors, groupLabels = T) %>%
+    #   color_labels(col = "white") %>%
+    #   # raise.dendrogram(0.1) %>%
+    #   as.ggdend() %>%
+    #   ggplot(horiz = T, offset_labels = -0.01) +
+    #   # geom_point(data = what$segments, aes(x, y, color = col), show.legend = T) +
+    #   theme(panel.border = element_blank(),
+    #         plot.margin = margin(l = -65,
+    #                              b = -15))
+
+    ggdendObject <- dendo %>%
+      set("branches_col", "#878787") %>%
+      set("branches_lwd", 1.1) %>%
+      color_branches(k = k, col = colors, groupLabels = T) %>%
+      color_labels(k = k, col = colors) %>%
+      # raise.dendrogram(0.1) %>%
+      as.ggdend()
+
+    dendoData <- ggdendObject$labels %>%
+      left_join(data.frame(cluster = cutree(dendo, k)) %>%
+                  mutate(label = rownames(.)), by = "label") %>%
+      distinct(col, cluster) %>%
+      right_join(ggdendObject$segments, by = 'col')
+
+    p <- ggplot() +
+      geom_segment(data = dendoData %>%
+                     mutate(cluster = factor(cluster, levels = na.omit(sort(unique(cluster))))),
+                   aes(x, y, xend = xend, yend = yend,
+                       color = cluster),
+                   size = 1.1) +
+      geom_text(data = ggdendObject$labels,
+                aes(x, y, label = label), color = "white", hjust = -0.05, size = 6) +
+      scale_color_manual(values = unique(dendoData$col),
+                         breaks = sort(na.omit(unique(dendoData$cluster)))) +
+      coord_flip() +
+      scale_y_reverse(expand = c(0.2, 0)) +
+      guides(color = guide_legend(nrow = 1, title.vjust = 1.3, title = "Clusters: ")) +
+      theme_dendro() +
+      theme(legend.position = "bottom",
+            legend.margin = margin(t=-25),
+            panel.border = element_blank(),
+            plot.margin = margin(l = -125,
+                                 b = 35, t = 15))
+
+    spatialPlot <- dendo %>%
+      cutree(k = k) %>%
+      data.frame(cluster = .) %>%
+      mutate(Species = rownames(.), .before = cluster) %>%
+      right_join(preArray, by = "Species") %>%
+      # Change this to propotion across all stations...
+      group_by(cluster, Species) %>%
+      mutate(propCPUE = CPUE/sum(CPUE)) %>%
+      ungroup() %>%
+      mutate(stationIndex = as.numeric(as.factor(Station))) %>%
+      # floorStation = ifelse(as.numeric(Station) <= 100,
+      #                       ceiling(as.numeric(Station)/100) * 100,
+      #                       floor(as.numeric(Station)/100) * 100)) %>%
+      # group_by(Station) %>%
+      # mutate(occurenceIndex = 1:n(),
+      #        stationLabel = ifelse(occurenceIndex == 1, Station, NA),
+      #        stationBreak = ifelse(occurenceIndex == 1, stationIndex, NA)) %>%
+      # ungroup() %>%
+      {
+        ggplot(., aes(Station, propCPUE, fill = Species)) +
+          geom_col(show.legend = F) +
+          facet_wrap(~cluster, scales = "free_y") +
+          scale_fill_viridis_d(option = "plasma") +
+          # scale_x_continuous(labels = na.omit(pull(., Station)),
+          #                    expand = expansion(add = (0.6))) +
+          theme(panel.grid.major = element_blank(),
+                axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+      }
+
+    temporalPlot <- dendo %>%
+      cutree(k = k) %>%
+      data.frame(cluster = .) %>%
+      mutate(Species = rownames(.), .before = cluster) %>%
+      right_join(preArray, by = "Species") %>%
+      group_by(cluster, Species) %>%
+      mutate(propCPUE = CPUE/sum(CPUE)) %>%
+      ggplot(aes(timeStep, propCPUE, fill = Species)) +
+      geom_col(show.legend = F) +
+      facet_wrap(~cluster, scales = "free_y") +
+      scale_fill_viridis_d(option = "plasma") +
+      scale_x_continuous(expand = expansion(mult = 0.01), breaks = c(3:6, 1)) +
+      theme(panel.grid.major = element_blank())
+
+    treeCut <- cutree(dendo, k = k)
+
+    sil <- silhouette(treeCut, dist)
+
+    silPlot <- sil %>%
+      .[, 1:3] %>%
+      data.frame() %>%
+      mutate(Species = names(treeCut)) %>%
+      group_by(cluster) %>%
+      arrange(-sil_width, .by_group = T) %>%
+      mutate(Species = factor(Species, levels = Species)) %>%
+      {
+        ggplot(., aes(cluster, sil_width, group = Species)) +
+          geom_col(position = position_dodge2(preserve = "single")) +
+          geom_text(aes(y = -0.01, label = Species), vjust = 0.2, hjust = 1,
+                    position = position_dodge2(width = 0.9, preserve = "single"), size = 6) +
+          geom_text(data = data.frame(cluster = 1:k, y = 0.95, Species = NA),
+                    aes(x = cluster, y = y, label = paste("Cluster", unique(cluster))), size = 7) +
+          annotate("segment", y = 0, yend = 0, x = 0.5, xend = Inf, size = rel(1), color = "#CCCCCC") +
+          annotate("segment", y = 0, yend = Inf, x = 0.5, xend = 0.5, size = rel(1), color = "#CCCCCC") +
+          scale_x_continuous(expand = expansion(mult = c(0.02, 0.05))) +
+          scale_y_continuous(expand = expansion(mult = c(0.2, 0.075))) +
+          coord_flip() +
+          labs(y = "Silhouette Width") +
+          theme(axis.text.y = element_blank(),
+                axis.title.y = element_blank(),
+                axis.ticks = element_blank(),
+                panel.grid.major.y = element_blank(),
+                panel.border = element_blank())
+      }
+
+    # Finally to create tanglegram to full model
+    plotTanglegram <- function() {
+      dendlist(fullModelDendro = fullModelDendro, reducedModelDendro = dendo) %>%
+        untangle(method = untangleMethod) %>%
+        tanglegram(...)
+    }
+  } else {
+    p <- NULL
+    spatialPlot <- NULL
+    temporalPlot <- NULL
+    sil <- NULL
+    silPlot <- NULL
+    plotTanglegram <- NULL
+  }
+
+  # Now to pull eval metric values
+  compareCommunity <- function(fullModelDendro,
+                               reducedModelDendro,
+                               k) {
+
+    # Calculating coph cor
+    compareDendograms <- intersect_trees(fullModelDendro,
+                                         reducedModelDendro)
+
+    copheneticCorrelation <- cor_cophenetic(compareDendograms, method = "kendall")
+
+    # calculating prop correct clustered
+    fullClustered <- cutree(fullModelDendro, k = k) %>%
+      data.frame(clusterFull = .) %>%
+      tibble::rownames_to_column(var = "Species")
+
+    reducedClustered <- cutree(reducedModelDendro, k = k) %>%
+      data.frame(clusterReduced = .) %>%
+      tibble::rownames_to_column(var = "Species")
+
+
+    proportionCorrect <- fullClustered %>%
+      full_join(reducedClustered,
+                by = "Species") %>%
+      mutate(clusterCorrect = ifelse(clusterFull == clusterReduced, T, F)) %>%
+      group_by(clusterCorrect) %>%
+      count() %>%
+      ungroup() %>%
+      mutate(propCorrect = n/sum(n)) %>%
+      filter(clusterCorrect) %>%
+      pull(propCorrect)
+
+    data.frame(copheneticCorrelation = copheneticCorrelation,
+               proportionCorrect = proportionCorrect)
+  }
+
+  evalCompare <- compareCommunity(fullModelDendro = fullModelDendro,
+                                  reducedModelDendro = dendo,
+                                  k = k)
+  # evalCompare <- NA
+  if (!is.null(iteration)) cat(unique(iteration), "\n")
+
+  list(dendogram = p,
+       spatialPlot = spatialPlot,
+       temporalPlot = temporalPlot,
+       sil = sil,
+       silPlot = silPlot,
+       evalCompare = evalCompare,
+       tanglegram = plotTanglegram)
+}
+```
+
+## Data aggregation
+
+Data was aggregated to the region level to allow comparison of the two datasets. First, Catch Per Unit Effort (CPUE) was calculated as: $CPUE = (Catch/VolumeTowed) * 10000 m^3$. CPUE of each species was then aggregated as a mean across all sampling stations within a Region via the formula: $aggMean_{ij} = \sum_{i = 1}^{n} (CPUE_j)/n_{ij}$, where $CPUE_{ij}$ is the summation of CPUE of species $i$ in region $j$ and $n_ij$ is the number of catch events of species $i$ in region $j$. Figure 2 visualizes the sampling stations of within each dataset in the Cache Slough, Sacramento Ship Channel, and Confluence Regions.
+
+```{r Regional map}
+stationConsistentYear <- lapply(c(data$FMWTRegion$Year %>% unique()),
+                                function(x) {
+                                  data$FMWTRegion %>% 
+                                    stationFilterYear(yearStart = x,
+                                                      perSurvey = T) %>% 
+                                    data.frame(Station = .)
+                                }) %>% 
+  setNames(data$FMWTRegion$Year %>% unique()) %>% 
+  bind_rows(.id = "Year") %>% 
+  group_by(Year) %>% 
+  mutate(cumulativeCount = 1:n()) %>% 
+  arrange(Year, Station)
+
+# Plotting the stations
+library(ggmap)
+
+mapDF <- filter(data$FMWT, Region %in% c(stationConsistentYear$Station)) %>%
+  mutate(study = "FMWT") %>%
+  bind_rows(filter(data$SS, Station %in% (data$SS %>%
+                                            filter(Region %in% c("Cache Slough", "Confluence",
+                                                                 "Sacramento Ship Channel")) %>%
+                                            pull(Station) %>%
+                                            unique())) %>%
+              mutate(study = "SS")) %>%
+  distinct(Station, StationLat, StationLong, Region, study) %>%
+  rename(lon = StationLong, lat = StationLat)
+
+map <- get_stamenmap(bbox = make_bbox(lon, lat, mapDF), maptype = "toner-lite", zoom = 10)
+
+ggmap(map) +
+  # geom_point(data = mapDF, aes(x = lon, y = lat, color = Region), size = 4) +
+  geom_text(data = mapDF, aes(x = lon, y = lat, color = Region, label = Station), size = 4) +
+  facet_wrap(~study) +
+  labs(x = "Longitude", y = "Latitude", color = "Region:") +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 16),
+        legend.title = element_text(size = 16))
+```
+
+## Species rarity {.tabset}
+
+Rare species can potentially disrupt the model fitting process by introducing too much noise and must be removed from the analysis. Here, rarity is defined as how many times a species per sampling event was caught across all sampling events within the regions of interest, where a sampling event is defined as a unique combination of sampling station and survey number (Figure 3c, 3d). The presence or absence of a species in all sampling events were added together to define rarity of the species (Figure 3a). Only species that were caught in both the FMWT and SS were considered for the analysis.
+
+### Catch event
+```{r raity plot, fig.cap="Figure 3a. A catch event is the number of presence occurrence of a species within a region of interest across the 2022 season from both the FMWT and SS datasets combined. Species with lower catch events are rarer species."}
+speciesCatchRateFMWT <- data$FMWT %>% 
+  filter(Year %in% 2022, Region %in% stationConsistentYear$Station) %>% 
+  group_by(SurveyNumber, Station) %>% 
+  mutate(sampleEvent = cur_group_id(),
+         catch = ifelse(CPUE > 0, 1, 0)) %>% 
+  group_by(Species, sampleEvent) %>% 
+  mutate(catch = sum(ifelse(sum(CPUE > 0, na.rm = T) > 0, T, F))) %>% 
+  group_by(Species) %>% 
+  summarise(totalSample = max(sampleEvent),
+            overallCatch = sum(catch), .groups = "drop") %>%
+  filter(overallCatch > 0)
+         # Species %in% speciesCatchRateAll)
+
+speciesCatchRateSS <- data$SS %>% 
+  filter(Year %in% 2022, Region %in% stationConsistentYear$Station) %>% 
+  group_by(SurveyNumber, Station) %>% 
+  mutate(sampleEvent = cur_group_id(),
+         catch = ifelse(CPUE > 0, 1, 0)) %>% 
+  group_by(Species, sampleEvent) %>% 
+  mutate(catch = sum(ifelse(sum(CPUE > 0, na.rm = T) > 0, T, F))) %>% 
+  group_by(Species) %>% 
+  summarise(totalSample = max(sampleEvent),
+            overallCatch = sum(catch), .groups = "drop") %>%
+  filter(overallCatch > 0)
+         # Species %in% speciesCatchRateAll)
+
+speciesCatchRate <- speciesCatchRateFMWT %>% 
+  transmute(Species, overallCatchFMWT = overallCatch) %>% 
+  full_join(speciesCatchRateSS %>% 
+              transmute(Species, overallCatchSS = overallCatch),
+            by = "Species") %>% 
+  rename(FMWT = overallCatchFMWT, SS = overallCatchSS) %>% 
+  pivot_longer(-Species, names_to = "study", values_to = "catch")
+
+# speciesCatchRate %>% 
+#   ggplot(aes(reorder(Species, catch), catch)) +
+#   geom_col() +
+#   geom_text(aes(label = catch), vjust = -1) +
+#   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+#   facet_wrap(~study) +
+#   scale_y_continuous(expand = expansion(mult = c(0.05, 0.07))) +
+#   labs(x = "Species", y = "# of Catch Events", title = "Filtered for only Cache Slough, Confluence, and Sacramento Ship Channel")
+
+speciesCatchRate <- speciesCatchRate %>% 
+  pivot_wider(names_from = study, values_from = catch) %>% 
+  filter(!is.na(FMWT), !is.na(SS)) %>% 
+  mutate(overallCatch = FMWT + SS)
+
+speciesCatchRate %>% 
+  ggplot(aes(reorder(Species, overallCatch), overallCatch)) +
+  geom_col() +
+  geom_text(aes(label = overallCatch), vjust = -1) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.07))) +
+  labs(x = "Species", y = "# of Catch Events", 
+       title = "Filtered for only Cache Slough, Confluence, and Sacramento Ship Channel")
+```
+
+### Total CPUE
+```{r, total CPUE, fig.cap="Figure 3b. Total CPUE of species caught in just the Cache Slough, Confluence, and Sacramento Ship Channel regions for 2022 across both FMWT and SS."}
+data$FMWT %>% 
+  bind_rows(data$SS) %>% 
+  filter(Region %in% c("Cache Slough", "Confluence", "Sacramento Ship Channel")) %>% 
+  group_by(Study, Species) %>% 
+  summarise(totalCPUE = sum(CPUE)) %>% 
+  filter(totalCPUE > 0) %>% 
+  group_by(Species) %>% 
+  mutate(sortCPUE = sum(totalCPUE)) %>% 
+  ungroup() %>% 
+  mutate(Species = reorder(Species, sortCPUE)) %>% 
+  ggplot(aes(Species, totalCPUE, fill = Study)) +
+  geom_col() +
+  scale_fill_manual(values = c("FMWT" = "grey60", "SS" = "grey40")) +
+  guides(fill = guide_legend(title.vjust = 1.5, title = "Study:")) +
+  labs(title = "Filtered for only Cache Slough, Confluence, and Sacramento Ship Channel") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "bottom")
+```
+
+### Sampling event
+```{r, tows per region, fig.cap="Figure 3c. Sampling event is defined as a tow at a station per survey number."}
+data$FMWT %>% 
+  bind_rows(data$SS) %>% 
+  distinct(Study, SurveyNumber, Station, Region) %>% 
+  group_by(Study, Region) %>% 
+  count() %>% 
+  mutate(Region = sapply(strsplit(Region, " "), function(x) paste(substr(x, 1, 1), collapse = ""))) %>% 
+  ggplot(aes(factor(Region, levels = c("SPBaCS", "NR", "SaHB",
+                                       "SM", "C", "CS", "SSC")),
+             n, fill = Study)) +
+  scale_fill_manual(values = c("FMWT" = "grey60", "SS" = "grey40")) +
+  geom_col(position = "dodge") +
+  geom_text(aes(y = n, label = n), vjust = -0.5, position = position_dodge(0.9), size = 6) +
+  guides(fill = guide_legend(title.vjust = 1.5, title = "Study:")) +
+  labs(x = "Region", y = "Number of Sampling Events") +
+  theme(legend.position = "bottom")
+```
+
+### Sampling event across time
+```{r tow per region per month, fig.cap="Figure 3d. Sampling event per region per month."}
+data$FMWT %>% 
+  bind_rows(data$SS) %>% 
+  distinct(Study, SurveyNumber, Station, Region) %>% 
+  mutate(Region = sapply(strsplit(Region, " "), function(x) paste(substr(x, 1, 1), collapse = ""))) %>% 
+  group_by(Study, 
+           SurveyNumber = factor(SurveyNumber), 
+           Region = factor(Region, levels = c("SPBaCS", "NR", "SaHB",
+                                       "SM", "C", "CS", "SSC"))) %>% 
+  count() %>%
+  ungroup() %>% 
+  complete(SurveyNumber, Region, Study) %>% 
+  mutate(across(c(Study, n), ~ifelse(is.na(.x), 0, .x))) %>% 
+  ggplot(aes(Region,
+             factor(SurveyNumber), fill = n)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "turbo") +
+  facet_wrap(~Study) +
+  labs(y = "Survey Number") +
+  theme(legend.position = "bottom",
+        legend.key.width = grid::unit(7, "cm"),
+        legend.key.height = grid::unit(0.75, "cm")) +
+    guides(fill = guide_colorbar(title.position = "bottom",
+                                   title.hjust = 0.5, title = "Sampling Event"))
+```
+
+## {-}
+
+## Data transformation {.tabset}
+
+Data is transformed to reduce model fitting time and aid model convergence. Several transformations of the data was explored and evaluated based on the reduction of skew and the percentage of overlap between the density curves across all combinations of all species (Figures 4a and 4b). No substantial differences were found between the transformations, supporting the use of a log tranformation. All data is also centered and scaled.
+
+```{r transformations}
+transformationsFMWT <- lapply(combn(speciesCatchRate$Species, 2, simplify = F), 
+                          function(x) {
+                            
+                            raw <- overlapping_coefficient(with(data$FMWTRegion, CPUE[Species %in% x[1]]),
+                                                           with(data$FMWTRegion, CPUE[Species %in% x[2]]),
+                                                           transformation = "raw")
+                            log <- overlapping_coefficient(with(data$FMWTRegion, CPUE[Species %in% x[1]]),
+                                                           with(data$FMWTRegion, CPUE[Species %in% x[2]]),
+                                                           transformation = "log")
+                            squareRoot <- overlapping_coefficient(with(data$FMWTRegion, CPUE[Species %in% x[1]]),
+                                                                  with(data$FMWTRegion, CPUE[Species %in% x[2]]),
+                                                                  transformation = "squareRoot")
+                            cubicRoot <- overlapping_coefficient(with(data$FMWTRegion, CPUE[Species %in% x[1]]),
+                                                                 with(data$FMWTRegion, CPUE[Species %in% x[2]]),
+                                                                 transformation = "cubicRoot")
+                            fourthRoot <- overlapping_coefficient(with(data$FMWTRegion, CPUE[Species %in% x[1]]),
+                                                                  with(data$FMWTRegion, CPUE[Species %in% x[2]]),
+                                                                  transformation = "fourthRoot")
+                            
+                            data.frame(species = rep(c(x), 5),
+                                       speciesCombination = 
+                                         rep(paste0(janitor::make_clean_names(x, case = "lower_camel"), 
+                                                    collapse = "."), 5)) %>% 
+                              bind_cols(bind_rows(raw, log, squareRoot, cubicRoot, fourthRoot))
+                          }) %>% 
+  bind_rows() %>% 
+  mutate(transformation = factor(transformation, levels = c("raw", "log", "squareRoot", "cubicRoot", "fourthRoot")))
+
+transformationsSS <- lapply(combn(speciesCatchRate$Species, 2, simplify = F), 
+                          function(x) {
+                            
+                            raw <- overlapping_coefficient(with(data$SSRegion, CPUE[Species %in% x[1]]),
+                                                           with(data$SSRegion, CPUE[Species %in% x[2]]),
+                                                           transformation = "raw")
+                            log <- overlapping_coefficient(with(data$SSRegion, CPUE[Species %in% x[1]]),
+                                                           with(data$SSRegion, CPUE[Species %in% x[2]]),
+                                                           transformation = "log")
+                            squareRoot <- overlapping_coefficient(with(data$SSRegion, CPUE[Species %in% x[1]]),
+                                                                  with(data$SSRegion, CPUE[Species %in% x[2]]),
+                                                                  transformation = "squareRoot")
+                            cubicRoot <- overlapping_coefficient(with(data$SSRegion, CPUE[Species %in% x[1]]),
+                                                                 with(data$SSRegion, CPUE[Species %in% x[2]]),
+                                                                 transformation = "cubicRoot")
+                            fourthRoot <- overlapping_coefficient(with(data$SSRegion, CPUE[Species %in% x[1]]),
+                                                                  with(data$SSRegion, CPUE[Species %in% x[2]]),
+                                                                  transformation = "fourthRoot")
+                            
+                            data.frame(species = rep(c(x), 5),
+                                       speciesCombination = 
+                                         rep(paste0(janitor::make_clean_names(x, case = "lower_camel"), 
+                                                    collapse = "."), 5)) %>% 
+                              bind_cols(bind_rows(raw, log, squareRoot, cubicRoot, fourthRoot))
+                          }) %>% 
+  bind_rows() %>% 
+  mutate(transformation = factor(transformation, levels = c("raw", "log", "squareRoot", "cubicRoot", "fourthRoot")))
+```
+
+### Fixed Stations
+```{r transformation plots, fig.cap="Figure 4a. Various transformations of the data. Due to no significant differences between the four transformations, a log transformation (most commonly used in catch data) was utilized moving forward."}
+library(patchwork)
+{transformationsFMWT %>%
+    pivot_longer(c(skewOld, skewNew), names_to = "skewType", values_to = "skew") %>%
+    mutate(type = factor(skewType, levels = c("skewOld", "skewNew"))) %>%
+    ggplot(aes(transformation, skew, color = type)) +
+    geom_boxplot(position = position_dodge(preserve = "single"), fill = "#2C2828FF", size = 1) +
+    scale_color_manual(values = c("#FF4D00", "#FFFFB8")) +
+    labs(y = "Skew", color = "Type") +
+    theme(axis.text.x.bottom = element_blank(),
+          axis.title.x.bottom = element_blank())}/
+  transformationsFMWT %>%
+  ggplot(aes(transformation, overlap)) +
+  geom_boxplot(color = "white", fill = "#2C2828FF") +
+  geom_text(data = transformationsFMWT %>% group_by(transformation) %>% summarise(n = sum(is.na(overlap))),
+            aes(x = transformation, y = 0.05, label = paste0("NAs = ", n)), size = 6) +
+  labs(x = "Transformation", y = "Overlap")
+```
+
+### Random Stations
+```{r fig.cap="Figure 4b. Various transformations of the data. Due to no significant differences between the four transformations, a log transformation (most commonly used in catch data) was utilized moving forward. Outlying overlaps in the log transformation due to Maeotias when compared to American Shad, age 0 Striped Bass, and Chameleon Goby."}
+{transformationsSS %>%
+    pivot_longer(c(skewOld, skewNew), names_to = "skewType", values_to = "skew") %>%
+    mutate(type = factor(skewType, levels = c("skewOld", "skewNew"))) %>%
+    ggplot(aes(transformation, skew, color = type)) +
+    geom_boxplot(position = position_dodge(preserve = "single"), fill = "#2C2828FF", size = 1) +
+    scale_color_manual(values = c("#FF4D00", "#FFFFB8")) +
+    labs(y = "Skew", color = "Type") +
+    theme(axis.text.x.bottom = element_blank(),
+          axis.title.x.bottom = element_blank())}/
+  transformationsSS %>%
+  ggplot(aes(transformation, overlap)) +
+  geom_boxplot(color = "white", fill = "#2C2828FF") +
+  geom_text(data = transformationsSS %>% group_by(transformation) %>% summarise(n = sum(is.na(overlap))),
+            aes(x = transformation, y = 0.05, label = paste0("NAs = ", n)), size = 6) +
+  labs(x = "Transformation", y = "Overlap")
+```
+
+## {-}
+
+## Model set up {.tabset}
+
+A principal tensor analysis paired with agglomerative clustering was used to describe community structure, visualized ultimately as a dendogram. Species rarity was explored through a sensitivity analysis. Specifically, the analysis began with a threshold of catch event of one, i.e., across all sampling event for the FMWT and SS, a species was caught at least once within the region and timespan of interest. This is then repeated using higher catch event thresholds (e.g., caught twice, three times, four times, and so on). The analysis supports a catch event threshold of 6 due to the large increase in percent deviance explained for both the FMWT and SS models in addition to maximizing the number of species retained (Figure 5).
+
+```{r running the models, results='hide'}
+# FMWT
+maxRows <- length(selectSpecies(speciesCatchRate, 1))
+
+inputsData <- lapply(1:maxRows, function(x) {
+  data.frame(iteration = which(1:maxRows %in% x),
+             scenario = which(1:maxRows %in% x),
+             removeStations = (NA)[1:maxRows],
+             yearStart = (2022)[1:maxRows],
+             # speciesThres = 6[1:9],
+             speciesFixed = selectSpecies(speciesCatchRate, x)[1:maxRows],
+             propThres = (NA)[1:maxRows],
+             speciesRemove = (NA)[1:maxRows],
+             modeNames = c("Station", "Survey", "Species")[1:maxRows])  
+})
+
+names(inputsData) <- sapply(inputsData, function(x) unique(x$scenario))
+
+# 12 is used here because model fails to converge when total number of species < 4
+models <- lapply(c("FMWTRegion", "SSRegion"), function(dataset) {
+  Map(simulateRemoval, 
+      removeStations = lapply(inputsData[1:12], function(x) x$removeStations %>% na.omit),
+      yearStart = lapply(inputsData[1:12], function(x) x$yearStart %>% na.omit),
+      # speciesThres = lapply(inputsData, function(x) x$speciesThres %>% na.omit),
+      propThres = lapply(inputsData[1:12], function(x) x$propThres %>% na.omit()),
+      speciesFixed = lapply(inputsData[1:12], function(x) x$speciesFixed), 
+      removeSpecies = lapply(inputsData[1:12], function(x) x$speciesRemove %>% na.omit),
+      iteration = lapply(inputsData[1:12], function(x) x$iteration %>% na.omit),
+      MoreArgs = list(data = data[[dataset]],
+                      timeStep = "Survey"))
+}) %>% 
+  setNames(c("FMWT", "SS"))
+```
+
+### Fixed Stations
+```{r catch event threshold FMWT, fig.cap="Figure 5a. The evaluation metric of PTA models fitted to a varying number of species found in the dataset based on species rarity. An inflection point occurs at a catch event threshold of 6, in which percent deviance increases the most."}
+sapply(models$FMWT, function(x) {
+  evalMetricSum <- x$modelScaleSummary %>%
+    data.frame() %>%
+    arrange(-X..Global.Pct..) %>%
+    # slice(1:n) %>%
+    pull(`X..Global.Pct..`) %>%
+    sum()
+
+  numSpecies <- x$preArray$Species %>%
+    unique() %>%
+    length()
+
+  data.frame(percentDeviance = evalMetricSum,
+             numSpecies = numSpecies)
+}) %>%
+  t() %>%
+  data.frame() %>%
+  tibble::rownames_to_column(var = "threshold") %>%
+  mutate(threshold = sort(unique(speciesCatchRate$overallCatch))[1:12],
+         across(everything(), ~as.numeric(.x))) %>%
+  pivot_longer(-threshold, values_to = "values", names_to = "metric") %>%
+  ggplot(aes(threshold, values)) +
+  # geom_vline(xintercept = 0.36) +
+  geom_point(size = 4) +
+  scale_x_continuous(breaks = seq(2, 20 ,2)) +
+  facet_wrap(~factor(metric, levels = c("percentDeviance", "numSpecies")), scales = "free_y") +
+  labs(x = "Catch event threshold", y = "Value")
+```
+
+### Random Stations
+```{r catch event threshold SS, fig.cap="Figure 5b. The evaluation metric of PTA models fitted to a varying number of species found in the dataset based on species rarity. An inflection point occurs at a catch event threshold of 6, in which percent deviance increases the most."}
+sapply(models$SS, function(x) {
+  evalMetricSum <- x$modelScaleSummary %>%
+    data.frame() %>%
+    arrange(-X..Global.Pct..) %>%
+    # slice(1:n) %>%
+    pull(`X..Global.Pct..`) %>%
+    sum()
+
+  numSpecies <- x$preArray$Species %>%
+    unique() %>%
+    length()
+
+  data.frame(percentDeviance = evalMetricSum,
+             numSpecies = numSpecies)
+}) %>%
+  t() %>%
+  data.frame() %>%
+  tibble::rownames_to_column(var = "threshold") %>%
+  mutate(threshold = sort(unique(speciesCatchRate$overallCatch))[1:12],
+         across(everything(), ~as.numeric(.x))) %>%
+  pivot_longer(-threshold, values_to = "values", names_to = "metric") %>%
+  ggplot(aes(threshold, values)) +
+  # geom_vline(xintercept = 0.36) +
+  geom_point(size = 4) +
+  scale_x_continuous(breaks = seq(2, 20 ,2)) +
+  facet_wrap(~factor(metric, levels = c("percentDeviance", "numSpecies")), scales = "free_y") +
+  labs(x = "Catch event threshold", y = "Value")
+```
+
+## {-}
+
+The selected model (with a catch event threshold of 6 for both datasets) were then evaluated to determine the number of decomposed tensors to keep. This was done visually via a scree plot (Source). The scree plot of both the FMWT and SS supports the use of the four tensors with the largest amount of perecent deviance explained (Figure 6ab).
+
+## {.tabset}
+
+### Fixed Stations
+```{r scree plot FMWT, fig.cap="Figure 6a. Scree plot for the fixed station dataset. The first four tensors were chosen as their percent deviance explained are distinctly higher (visually) than the remaining tensors."}
+models$FMWT$`6`$plotScree
+```
+
+### SS Stations 
+```{r scree plot SS, fig.cap="Figure 6b. Scree plot for the random station dataset. There is support for the first three tensors due the large differences between them; however, the fourth tensor was added to maintail comparability with the fixed station model."}
+models$SS$`6`$plotScree
+```
+
+## {-}
+
+The first four tensors of each model were then used to calculate the distance matrix for agglomerative clustering.
+
+```{r distance matrix}
+# tensors to keep, just first 4
+keep <- lapply(c("FMWT", "SS"), function(i) {
+  Map(keepTensors, 
+      data = lapply(models[[i]], function(x) x$modelScaleSummary),
+      end = 4)
+  }) %>% 
+  setNames(c("FMWT", "SS"))
+
+projectionDF <- lapply(c("FMWT", "SS"), function(i) {
+  Map(createProjectionDF,
+      tensorsToKeep = keep[[i]],
+      model = lapply(models[[i]], function(x) x$ptaModel))
+  }) %>% 
+  setNames(c("FMWT", "SS"))
+```
+
+Four different clustering methods were explored to visualize the community composition: single, complete, average, and ward.D2. The optimal method was the one that maximized both the cophenetic correlation and Gower's distance metrics (source); if no singular approach maximized both metrics, the `average` clustering method was used. 
+
+```{r clustering methods, results='hide'}
+clustered <- lapply(c("FMWT", "SS"), function(i) {
+  Map(optimizeCluster,
+      data = projectionDF[[i]])
+}) %>% 
+  setNames(c("FMWT", "SS"))
+```
+
+The optimal number of clusters was explored by maximizing the average silhouette width across a possible range of number of clusters, from two to the total number of species in the analysis less one. For the fixed stations, seven clusters were optimal (Figure 7a), while for the random stations, three clusters were optimal (Figure 7b). However, in order to compare the community structures of the two datasets, the optimal of three for the random stations was bypassed and a value of seven was used in place. This value is the third highest average silhouette distance value across all clusters.
+
+## {.tabset}
+
+### Fixed stations
+```{r number of optimal clusters FMWT, fig.cap="Figure 7a. Average Silhouette width across all clusters for the fixed stations. The highest value is highlighted red."}
+clustered$FMWT$`5`$p
+```
+
+### Random stations
+```{r number of optimal cluster SS, fig.cap="Figure 7b. Average Silhouette width across all clusters for the random stations. The highest value is highlighted red."}
+clustered$SS$`5`$p
+```
+
+## {-}
+
+Since the average silhouette width of four clusters is comparable to the optimal of five and four being the optimal for the random stations, a clustering of four was used for both studies moving forward.
+
+## Community visualization {.tabset}
+
+A dendogram can be used to visualize the community composition of the underlying dataset. In this study, the dendogram is interpreted as how close each species is to one another based on where and when they are caught by the survey.
+
+```{r dendogram FMWT}
+assessmentPlots <- lapply(c("FMWT", "SS"), function(i) {
+  lapply(1:length(clustered[[i]]), function(x) {
+  evaluateCommunity(dendo = clustered[[i]][[x]]$taxaDendro,
+                    preArray = models[[i]][[x]]$preArray,
+                    fullModelDendro = clustered[[i]][[x]]$taxaDendro,
+                    k = clustered[[i]][[x]]$k.best.silhouette,
+                    dist = clustered[[i]][[x]]$dist,
+                    plot = T,
+                    untangleMethod = "labels",
+                    columns_width = c(5, 2, 5), 
+                    margin_inner = 12, 
+                    k_labels = clustered[[i]][[x]]$k.best.silhouette,
+                    colors = cols)
+}) %>% 
+  setNames(names(clustered[[i]]))
+}) %>% 
+  setNames(c("FMWT", "SS"))
+
+assessmentPlotsSeven <- lapply(c("FMWT", "SS"), function(i) {
+
+  evaluateCommunity(dendo = clustered[[i]]$`5`$taxaDendro,
+                    preArray = models[[i]]$`5`$preArray,
+                    fullModelDendro = clustered[[i]]$`5`$taxaDendro,
+                    k = 7,
+                    dist = clustered[[i]]$`5`$dist,
+                    plot = T,
+                    untangleMethod = "labels",
+                    columns_width = c(5, 2, 5), 
+                    margin_inner = 12, 
+                    k_labels = 7,
+                    colors = cols)
+}) %>% 
+  setNames(c("FMWT", "SS"))
+```
+
+### Fixed station
+```{r dendogram FMWT 7, fig.cap="Figure 8a. Dendogram of the fixed station dataset, with seven distinct clusters."}
+assessmentPlotsSeven$FMWT$dendogram
+```
+
+### Fixed station
+```{r dendogram SS 7, fig.cap="Figure 8b. Dendogram of the random station dataset, with seven distinct clusters."}
+assessmentPlotsSeven$SS$dendogram
+```
+
+## {-}
+
+The similarity of each species within a clustered can be quantified by their silhouette width, where a value of 1 indicates exactly the same catch patterns across space and time to others within the cluster, while a negative value indicates that species is not a particularly good fit to other species within the cluster. All species in the final clustering had a positive silhouette value, supporting the proposed clustering.
+
+### Silhouette width {.tabset}
+
+#### Fixed stations
+```{r silhouette width fixed, fig.cap="Figure 9a. Silhouette width of each species organized per cluster for the fixed station dataset."}
+assessmentPlotsSeven$FMWT$silPlot
+```
+
+#### Random stations
+```{r silhouette width random, fig.cap="Figure 9b. Silhouette width of each species organized per cluster for the random station dataset."}
+assessmentPlotsSeven$SS$silPlot
+```
+
+## Tanglegram
+
+Finally, community composition differences can be explored by comparing two dendograms with one another. A tanglegram compares two dendogram with one another to visualize differences. Species within the same cluster between the two dendograms are featured with colored lines; species that have moved clusters are not colored.
+
+```{r tanglegram, fig.cap="Figure 10. A comparison of the community structures of the dendograms of the fixed and random station datasets. Species that are clustered within the same grouping across both dendograms are indicated by colored lines."}
+dendlist(fixedStations = clustered$FMWT$`5`$taxaDendro, randomStations = clustered$SS$`5`$taxaDendro) %>%
+  untangle(method = "labels") %>%
+  tanglegram(columns_width = c(5, 2, 5),
+             main_left = "Fixed Stations",
+             main_right = "Random Stations",
+             margin_inner = 14,
+             k_labels = 7, lab.cex = 1.5, cex.axis = 2)
+```
+
