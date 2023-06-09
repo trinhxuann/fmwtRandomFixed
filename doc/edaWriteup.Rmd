@@ -413,6 +413,44 @@ pScree <- function(model) {
     labs(x = "Component Number", y = "Squared Singular Value (%)")
 }
 
+# This function is taken directly from the package but a slight bug with the warning is fixed
+Multcent <- function (dat, bi = c(1, 2), by = 3, centre = mean, centrebyBA = c(TRUE, 
+    FALSE), scalebyBA = c(TRUE, FALSE)) 
+{
+    if (centrebyBA[1]) {
+        me <- apply(dat, by, FUN = centre)
+        dat <- sweep(dat, by, me)
+    }
+    sdev <- function(x) {
+        sd(as.numeric(x))
+    }
+    if (scalebyBA[1]) {
+        sca <- apply(dat, by, sdev)
+        if (any(sca == 1)) 
+            warning("zero variances were replaced by 1")
+        sca <- ifelse(sca == 0, 1, sca)
+        dat <- sweep(dat, by, sca, FUN = "/")
+    }
+    if (!is.null(bi)) {
+        for (g in 1:length(bi)) {
+            me <- apply(dat, c(bi[g], by), FUN = centre)
+            dat <- sweep(dat, c(bi[g], by), me)
+        }
+    }
+    if (centrebyBA[2]) {
+        me <- apply(dat, by, FUN = centre)
+        dat <- sweep(dat, by, me)
+    }
+    if (scalebyBA[2]) {
+        sca <- apply(dat, by, sdev)
+        if (any(sca == 1)) 
+            warning("zero variances were replaced by 1")
+        sca <- ifelse(sca == 0, 1, sca)
+        dat <- sweep(dat, by, sca, FUN = "/")
+    }
+    return(dat)
+}
+
 # Function to run the data through the PTA modeling process itself
 # NOTE: transformation needs to be specified manually WITHIN this function
 # Data is scaled and centered using the MultiCent function, which does it per species
