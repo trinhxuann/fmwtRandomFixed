@@ -10,6 +10,7 @@ editor_options:
 ---
 
 ```{r setup, include=FALSE}
+startTime <- Sys.time()
 knitr::opts_chunk$set(dpi=320, fig.width=15, fig.height=10, warning=FALSE, message=F, 
                       dev = "CairoPNG",
                       dev.args = list(pointsize = 13), echo = T)
@@ -1365,3 +1366,4 @@ dendlist(fixedStations = clustered$FMWT$`5`$taxaDendro, randomStations = cluster
              k_labels = 7, lab.cex = 1.5, cex.axis = 2)
 ```
 
+[Total time elapsed to create document: `r round(as.numeric(Sys.time() - startTime, units = "mins"), 2)` minutes.]{style="float:right"}
