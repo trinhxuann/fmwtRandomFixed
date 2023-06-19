@@ -23,6 +23,7 @@ library(PTAk)
 library(cluster)
 library(dendextend)
 library(lubridate)
+library(kableExtra)
 
 options(scipen = 99999)
 
@@ -31,7 +32,7 @@ myTheme <- dark_theme_bw(base_size = 24) +
         plot.background = element_rect(fill = "#2c2828", color = NA),
         panel.background = element_blank(),
         # panel.grid.major = element_blank(),
-        panel.grid.major = element_line(color = "#646464", size = 0.2),
+        panel.grid.major = element_line(color = "#646464", linewidth = 0.2),
         legend.background = element_blank(),
         legend.key = element_blank())
 
@@ -682,6 +683,46 @@ optimizeCluster <- function(data, distMethod = "euclidean") {
 # check intuition of the model
 cols <- c('#01665e', '#8c510a', '#b2182b', '#5ab4ac', '#d8b365', '#d6604d', '#c7eae5', '#f6e8c3', '#f4a582','white')
 
+# Function to pull out cophanetic correlation and proportion correct between two dendograms
+compareCommunity <- function(fullModelDendro,
+                               reducedModelDendro,
+                               k) {
+
+    # Calculating coph cor
+    compareDendograms <- intersect_trees(fullModelDendro,
+                                         reducedModelDendro)
+
+    copheneticCorrelation <- cor_cophenetic(compareDendograms, method = "kendall")
+
+    # calculating prop correct clustered
+    fullClustered <- cutree(fullModelDendro, k = k) %>%
+      data.frame(clusterFull = .) %>%
+      tibble::rownames_to_column(var = "Species")
+
+    reducedClustered <- cutree(reducedModelDendro, k = k) %>%
+      data.frame(clusterReduced = .) %>%
+      tibble::rownames_to_column(var = "Species")
+
+    proportionCorrect <- fullClustered %>%
+      full_join(reducedClustered,
+                by = "Species") %>%
+      mutate(clusterCorrect = ifelse(clusterFull == clusterReduced, T, F)) %>%
+      group_by(clusterCorrect) %>%
+      count() %>%
+      ungroup() %>%
+      mutate(propCorrect = n/sum(n)) %>%
+      filter(clusterCorrect) %>%
+      pull(propCorrect)
+    
+    numberMismatched <- length(which(common_subtrees_clusters(fullModelDendro, reducedModelDendro) == 0))
+
+    data.frame(copheneticCorrelation = copheneticCorrelation,
+               proportionCorrect = proportionCorrect,
+               numberMismatched = numberMismatched/nrow(reducedClustered),
+               numberClusters = k,
+               numberSpecies = nrow(fullClustered))
+  }
+
 evaluateCommunity <- function(dendo, k, dist, preArray, colors,
                               fullModelDendro, untangleMethod,
                               iteration = NULL,
@@ -827,42 +868,6 @@ evaluateCommunity <- function(dendo, k, dist, preArray, colors,
     plotTanglegram <- NULL
   }
 
-  # Now to pull eval metric values
-  compareCommunity <- function(fullModelDendro,
-                               reducedModelDendro,
-                               k) {
-
-    # Calculating coph cor
-    compareDendograms <- intersect_trees(fullModelDendro,
-                                         reducedModelDendro)
-
-    copheneticCorrelation <- cor_cophenetic(compareDendograms, method = "kendall")
-
-    # calculating prop correct clustered
-    fullClustered <- cutree(fullModelDendro, k = k) %>%
-      data.frame(clusterFull = .) %>%
-      tibble::rownames_to_column(var = "Species")
-
-    reducedClustered <- cutree(reducedModelDendro, k = k) %>%
-      data.frame(clusterReduced = .) %>%
-      tibble::rownames_to_column(var = "Species")
-
-
-    proportionCorrect <- fullClustered %>%
-      full_join(reducedClustered,
-                by = "Species") %>%
-      mutate(clusterCorrect = ifelse(clusterFull == clusterReduced, T, F)) %>%
-      group_by(clusterCorrect) %>%
-      count() %>%
-      ungroup() %>%
-      mutate(propCorrect = n/sum(n)) %>%
-      filter(clusterCorrect) %>%
-      pull(propCorrect)
-
-    data.frame(copheneticCorrelation = copheneticCorrelation,
-               proportionCorrect = proportionCorrect)
-  }
-
   evalCompare <- compareCommunity(fullModelDendro = fullModelDendro,
                                   reducedModelDendro = dendo,
                                   k = k)
@@ -963,7 +968,8 @@ speciesCatchRate <- speciesCatchRateFMWT %>%
   rename(FMWT = overallCatchFMWT, SS = overallCatchSS) %>% 
   pivot_longer(-Species, names_to = "study", values_to = "catch")
 
-# speciesCatchRate %>% 
+# speciesCatchRate %>%
+#   pivot_longer(c(FMWT, SS), names_to = "study", values_to = "catch") %>% 
 #   ggplot(aes(reorder(Species, catch), catch)) +
 #   geom_col() +
 #   geom_text(aes(label = catch), vjust = -1) +
@@ -1369,7 +1375,7 @@ assessmentPlotsSeven <- lapply(c("FMWT", "SS"), function(i) {
 assessmentPlotsSeven$FMWT$dendogram
 ```
 
-### Fixed station
+### Random station
 ```{r dendogram SS 7, fig.cap="Figure 8b. Dendogram of the random station dataset, with seven distinct clusters."}
 assessmentPlotsSeven$SS$dendogram
 ```
@@ -1390,18 +1396,26 @@ assessmentPlotsSeven$FMWT$silPlot
 assessmentPlotsSeven$SS$silPlot
 ```
 
-## Tanglegram
+## Community comparison
 
 Finally, community composition differences can be explored by comparing two dendograms with one another. A tanglegram compares two dendogram with one another to visualize differences. Species within the same cluster between the two dendograms are featured with colored lines; species that have moved clusters are not colored.
 
 ```{r tanglegram, fig.cap="Figure 10. A comparison of the community structures of the dendograms of the fixed and random station datasets. Species that are clustered within the same grouping across both dendograms are indicated by colored lines."}
 dendlist(fixedStations = clustered$FMWT$`5`$taxaDendro, randomStations = clustered$SS$`5`$taxaDendro) %>%
-  untangle(method = "labels") %>%
+  # untangle(method = "labels") %>%
   tanglegram(columns_width = c(5, 2, 5),
              main_left = "Fixed Stations",
              main_right = "Random Stations",
              margin_inner = 14,
              k_labels = 7, lab.cex = 1.5, cex.axis = 2)
+```
+
+Four evaluation metrics can be used to numerically measure how similar the two dendograms are: 1) proportion of clusters identified correctly, 2) number of species mismatches, and 3) cophenetic correlation. The proportion of clusters identified correctly is calculated as the proportion of subgroups of species that are clustered the same between both dendograms; the number of species mismatches enumerates the number of species that ranked differently between both dendeograms; and the cophenetic correlation is a measure of how similar the distance matrices are between both dendograms.
+
+```{r evaluation metrics}
+compareCommunity(clustered$FMWT$`5`$taxaDendro, clustered$SS$`5`$taxaDendro, k = 7) %>% 
+  kbl(caption = "Evaluation metrics comparing two dendograms.") %>% 
+  kable_classic(full_width = F, html_font = "Cambria", "striped")
 ```
 
 [Total time elapsed to create document: `r round(as.numeric(Sys.time() - startTime, units = "mins"), 2)` minutes.]{style="float:right"}
